@@ -1,2 +1,5 @@
-paho-mqtt
-requests
+# MQTT 客戶端
+paho-mqtt==1.6.1
+
+# HTTP 請求庫
+requests==2.31.0
