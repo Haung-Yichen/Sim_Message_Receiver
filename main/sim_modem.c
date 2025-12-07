@@ -25,6 +25,25 @@ static const char *TAG = "SIM_MODEM";
 static QueueHandle_t uart0_queue;
 static SemaphoreHandle_t flush_sem = NULL;
 
+// --- Multipart SMS Assembly ---
+// 分段簡訊組合配置
+#define SMS_FRAGMENT_TIMEOUT_MS     5000    // 片段逾時時間 (同一則訊息的片段應在此時間內到達)
+#define SMS_MAX_FRAGMENTS           10      // 每則訊息最大片段數
+#define SMS_COMBINED_MSG_SIZE       2048    // 組合後訊息最大長度
+
+// 分段簡訊緩衝結構
+typedef struct {
+    char sender[64];                        // 發送者
+    char fragments[SMS_MAX_FRAGMENTS][512]; // 片段內容
+    int fragment_count;                     // 已收到的片段數
+    int indices[SMS_MAX_FRAGMENTS];         // 各片段的 SIM 儲存索引 (用於刪除)
+    int64_t first_fragment_time;            // 第一個片段的接收時間
+    bool active;                            // 此緩衝槽是否使用中
+} sms_assembly_buffer_t;
+
+#define SMS_ASSEMBLY_SLOTS 4                // 同時處理的分段訊息數量
+static sms_assembly_buffer_t s_assembly_buffers[SMS_ASSEMBLY_SLOTS] = {0};
+
 // Helper to convert hex digit to int
 static int hex2int(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -78,6 +97,138 @@ static void delete_sms(int index)
     snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", index);
     send_at_command(cmd);
     ESP_LOGI(TAG, "Deleted SMS at index %d", index);
+}
+
+// --- Multipart SMS Assembly Functions ---
+
+// 取得當前時間 (毫秒)
+static int64_t get_time_ms(void) {
+    return (int64_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+// 尋找現有的組合緩衝槽 (依據發送者)
+static sms_assembly_buffer_t* find_assembly_buffer(const char *sender) {
+    for (int i = 0; i < SMS_ASSEMBLY_SLOTS; i++) {
+        if (s_assembly_buffers[i].active && 
+            strcmp(s_assembly_buffers[i].sender, sender) == 0) {
+            return &s_assembly_buffers[i];
+        }
+    }
+    return NULL;
+}
+
+// 取得或建立組合緩衝槽
+static sms_assembly_buffer_t* get_or_create_assembly_buffer(const char *sender) {
+    // 先尋找現有的
+    sms_assembly_buffer_t *buf = find_assembly_buffer(sender);
+    if (buf) return buf;
+    
+    // 尋找空的槽
+    for (int i = 0; i < SMS_ASSEMBLY_SLOTS; i++) {
+        if (!s_assembly_buffers[i].active) {
+            s_assembly_buffers[i].active = true;
+            strncpy(s_assembly_buffers[i].sender, sender, sizeof(s_assembly_buffers[i].sender) - 1);
+            s_assembly_buffers[i].sender[sizeof(s_assembly_buffers[i].sender) - 1] = '\0';
+            s_assembly_buffers[i].fragment_count = 0;
+            s_assembly_buffers[i].first_fragment_time = get_time_ms();
+            return &s_assembly_buffers[i];
+        }
+    }
+    
+    // 找不到空槽，覆蓋最舊的
+    int oldest_idx = 0;
+    int64_t oldest_time = s_assembly_buffers[0].first_fragment_time;
+    for (int i = 1; i < SMS_ASSEMBLY_SLOTS; i++) {
+        if (s_assembly_buffers[i].first_fragment_time < oldest_time) {
+            oldest_time = s_assembly_buffers[i].first_fragment_time;
+            oldest_idx = i;
+        }
+    }
+    
+    ESP_LOGW(TAG, "Assembly buffer full, overwriting oldest slot for sender: %s", sender);
+    memset(&s_assembly_buffers[oldest_idx], 0, sizeof(sms_assembly_buffer_t));
+    s_assembly_buffers[oldest_idx].active = true;
+    strncpy(s_assembly_buffers[oldest_idx].sender, sender, sizeof(s_assembly_buffers[oldest_idx].sender) - 1);
+    s_assembly_buffers[oldest_idx].first_fragment_time = get_time_ms();
+    return &s_assembly_buffers[oldest_idx];
+}
+
+// 發布組合後的完整訊息
+static void publish_assembled_sms(sms_assembly_buffer_t *buf) {
+    if (!buf || buf->fragment_count == 0) return;
+    
+    char combined_msg[SMS_COMBINED_MSG_SIZE] = {0};
+    
+    // 按順序組合所有片段
+    for (int i = 0; i < buf->fragment_count; i++) {
+        if (strlen(combined_msg) + strlen(buf->fragments[i]) < SMS_COMBINED_MSG_SIZE - 1) {
+            strcat(combined_msg, buf->fragments[i]);
+        }
+    }
+    
+    ESP_LOGI(TAG, "Publishing assembled SMS from %s (%d fragments): %s", 
+             buf->sender, buf->fragment_count, combined_msg);
+    
+    if (mqtt_client && g_app_state == APP_STATE_MQTT_CONNECTED) {
+        cJSON *root = cJSON_CreateObject();
+        if (root) {
+            cJSON_AddStringToObject(root, "sender", buf->sender);
+            cJSON_AddStringToObject(root, "message", combined_msg);
+            char *json_str = cJSON_PrintUnformatted(root);
+            
+            if (json_str) {
+                int msg_id = esp_mqtt_client_publish(mqtt_client, "sim_bridge/sms", json_str, 0, 1, 0);
+                free(json_str);
+                
+                if (msg_id != -1) {
+                    // 刪除所有相關的 SMS
+                    for (int i = 0; i < buf->fragment_count; i++) {
+                        if (buf->indices[i] >= 0) {
+                            delete_sms(buf->indices[i]);
+                        }
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to publish assembled SMS, keeping in SIM");
+                }
+            }
+            cJSON_Delete(root);
+        }
+    } else {
+        ESP_LOGW(TAG, "MQTT not connected, keeping assembled SMS in SIM");
+    }
+    
+    // 清空緩衝槽
+    memset(buf, 0, sizeof(sms_assembly_buffer_t));
+}
+
+// 檢查並處理逾時的片段緩衝
+static void check_assembly_timeouts(void) {
+    int64_t now = get_time_ms();
+    for (int i = 0; i < SMS_ASSEMBLY_SLOTS; i++) {
+        if (s_assembly_buffers[i].active) {
+            if ((now - s_assembly_buffers[i].first_fragment_time) > SMS_FRAGMENT_TIMEOUT_MS) {
+                ESP_LOGI(TAG, "Assembly timeout for sender: %s, publishing %d fragments",
+                         s_assembly_buffers[i].sender, s_assembly_buffers[i].fragment_count);
+                publish_assembled_sms(&s_assembly_buffers[i]);
+            }
+        }
+    }
+}
+
+// 新增片段到組合緩衝
+static void add_fragment_to_buffer(const char *sender, const char *message, int sms_index) {
+    sms_assembly_buffer_t *buf = get_or_create_assembly_buffer(sender);
+    if (!buf) return;
+    
+    if (buf->fragment_count < SMS_MAX_FRAGMENTS) {
+        strncpy(buf->fragments[buf->fragment_count], message, 
+                sizeof(buf->fragments[buf->fragment_count]) - 1);
+        buf->indices[buf->fragment_count] = sms_index;
+        buf->fragment_count++;
+        ESP_LOGI(TAG, "Added fragment %d for sender: %s", buf->fragment_count, sender);
+    } else {
+        ESP_LOGW(TAG, "Max fragments reached for sender: %s, discarding", sender);
+    }
 }
 
 static void parse_and_publish_sms(char *data)
@@ -146,33 +297,14 @@ static void parse_and_publish_sms(char *data)
                 
                 ESP_LOGI(TAG, "SMS [%d] From: %s, Msg: %s", index, sender, msg_utf8);
 
-                if (mqtt_client && g_app_state == APP_STATE_MQTT_CONNECTED) {
-                    cJSON *root = cJSON_CreateObject();
-                    if (root) {
-                        cJSON_AddStringToObject(root, "sender", sender);
-                        cJSON_AddStringToObject(root, "message", msg_utf8);
-                        char *json_str = cJSON_PrintUnformatted(root);
-                        
-                        if (json_str) {
-                            int msg_id = esp_mqtt_client_publish(mqtt_client, "sim_bridge/sms", json_str, 0, 1, 0);
-                            free(json_str);
-                            
-                            if (msg_id != -1) {
-                                // Only delete if successfully queued for publish
-                                delete_sms(index);
-                            } else {
-                                ESP_LOGE(TAG, "Failed to publish SMS, keeping in SIM");
-                            }
-                        }
-                        cJSON_Delete(root);
-                    }
-                } else {
-                    ESP_LOGW(TAG, "MQTT not connected, keeping SMS in SIM");
-                }
+                // 使用組合緩衝區處理片段
+                // 將訊息片段加入緩衝區，待逾時後統一發布
+                add_fragment_to_buffer(sender, msg_utf8, index);
             }
         }
     }
 }
+
 
 void sim_modem_trigger_flush(void)
 {
@@ -225,6 +357,9 @@ static void rx_task(void *arg)
     }
 
     for (;;) {
+        // 檢查分段簡訊組合逾時
+        check_assembly_timeouts();
+        
         // Check if we need to flush messages (Triggered by MQTT Connect or +CMTI)
         if (xSemaphoreTake(flush_sem, 0) == pdTRUE) {
              if (g_app_state == APP_STATE_MQTT_CONNECTED) {
@@ -232,6 +367,7 @@ static void rx_task(void *arg)
                  send_at_command("AT+CMGL=\"ALL\"");
              }
         }
+
 
         if (xQueueReceive(uart0_queue, (void *)&event, (TickType_t)100)) { // 100ms timeout to check flush_sem
             switch (event.type) {

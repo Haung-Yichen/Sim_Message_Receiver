@@ -61,7 +61,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         g_app_state = APP_STATE_INIT;
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         g_app_state = APP_STATE_INIT;
-        ESP_LOGI(TAG, "WiFi disconnected, retrying...");
+        ESP_LOGI(TAG, "WiFi disconnected, retrying in 5 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
