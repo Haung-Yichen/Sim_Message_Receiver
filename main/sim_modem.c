@@ -89,6 +89,7 @@ static sms_assembly_buffer_t* get_or_create_assembly_buffer(const char *sender, 
     for (int i = 0; i < SMS_ASSEMBLY_SLOTS; i++) {
         if (!s_assembly_buffers[i].active) {
             memset(&s_assembly_buffers[i], 0, sizeof(sms_assembly_buffer_t));
+            memset(s_assembly_buffers[i].indices, -1, sizeof(s_assembly_buffers[i].indices));
             s_assembly_buffers[i].active = true;
             s_assembly_buffers[i].ref_num = ref_num;
             s_assembly_buffers[i].total_parts = total_parts;
@@ -111,6 +112,7 @@ static sms_assembly_buffer_t* get_or_create_assembly_buffer(const char *sender, 
     
     ESP_LOGW(TAG, "Assembly buffer full, overwriting oldest slot");
     memset(&s_assembly_buffers[oldest_idx], 0, sizeof(sms_assembly_buffer_t));
+    memset(s_assembly_buffers[oldest_idx].indices, -1, sizeof(s_assembly_buffers[oldest_idx].indices));
     s_assembly_buffers[oldest_idx].active = true;
     s_assembly_buffers[oldest_idx].ref_num = ref_num;
     s_assembly_buffers[oldest_idx].total_parts = total_parts;
@@ -179,7 +181,7 @@ static void publish_assembled_sms(sms_assembly_buffer_t *buf) {
                 if (msg_id != -1) {
                     // 刪除所有相關的 SMS
                     for (int i = 1; i <= buf->total_parts && i <= SMS_MAX_FRAGMENTS; i++) {
-                        if (buf->indices[i] >= 0) {
+                        if (buf->part_received[i] && buf->indices[i] >= 0) {
                             delete_sms(buf->indices[i]);
                         }
                     }
@@ -277,7 +279,7 @@ static void parse_pdu_cmgl(char *data) {
     pdu_start++; // Skip \n
     
     // 複製 PDU hex 字串
-    char pdu_hex[512] = {0};
+    char pdu_hex[768] = {0};
     int i = 0;
     while (pdu_start[i] && pdu_start[i] != '\r' && pdu_start[i] != '\n' && i < (int)sizeof(pdu_hex) - 1) {
         pdu_hex[i] = pdu_start[i];
