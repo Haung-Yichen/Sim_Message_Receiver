@@ -205,14 +205,26 @@ bool pdu_decode(const char *pdu_hex, pdu_sms_t *out) {
     int oa_octets = (oa_len + 1) / 2;
     if ((size_t)pos + oa_octets * 2 > len) return false;
     
-    // Add '+' for international format
-    int sender_offset = 0;
-    if ((oa_type & 0x70) == 0x10) { // International
+    // Extract Type of Number (bits 6-4 of ToA byte)
+    int ton = (oa_type >> 4) & 0x07;
+    
+    if (ton == 0x05) {
+        // Alphanumeric sender (GSM 7-bit packed in address field)
+        // oa_len = number of usable semi-octets (nibbles), not digit count
+        // Each nibble is 4 bits, so total bits = oa_len * 4
+        // Number of GSM 7-bit septets = total_bits / 7
+        int num_septets = (oa_len * 4) / 7;
+        decode_gsm7bit(pdu_hex + pos, num_septets, 0, out->sender, sizeof(out->sender));
+    } else if (ton == 0x01) {
+        // International number: prepend '+'
         out->sender[0] = '+';
-        sender_offset = 1;
+        decode_phone_number(pdu_hex + pos, oa_len, out->sender + 1,
+                            sizeof(out->sender) - 1);
+    } else {
+        // National (0x02), Unknown (0x00), and others: BCD without prefix
+        decode_phone_number(pdu_hex + pos, oa_len, out->sender,
+                            sizeof(out->sender));
     }
-    decode_phone_number(pdu_hex + pos, oa_len, out->sender + sender_offset, 
-                        sizeof(out->sender) - sender_offset);
     pos += oa_octets * 2;
     
     // 4. Protocol Identifier (skip)
