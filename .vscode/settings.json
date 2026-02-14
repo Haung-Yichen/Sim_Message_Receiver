@@ -16,5 +16,6 @@
     "--compile-commands-dir=${workspaceFolder}\\build"
   ],
   "idf.portWin": "COM6",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\Users\\macma\\esp\\v5.5.1\\esp-idf"
 }
