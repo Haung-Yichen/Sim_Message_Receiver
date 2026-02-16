@@ -27,7 +27,7 @@ static QueueHandle_t uart0_queue;
 static SemaphoreHandle_t flush_sem = NULL;
 
 // --- Multipart SMS Assembly (PDU Mode) ---
-#define SMS_FRAGMENT_TIMEOUT_MS     10000   // 片段逾時時間 (加長到10秒)
+#define SMS_FRAGMENT_TIMEOUT_MS     30000   // 片段逾時 30 秒 (給更多時間等所有分段)
 #define SMS_MAX_FRAGMENTS           10      // 每則訊息最大片段數
 #define SMS_COMBINED_MSG_SIZE       2048    // 組合後訊息最大長度
 
@@ -47,6 +47,52 @@ typedef struct {
 #define SMS_ASSEMBLY_SLOTS 4
 static sms_assembly_buffer_t s_assembly_buffers[SMS_ASSEMBLY_SLOTS] = {0};
 
+// --- 已處理索引追蹤 (防止重複處理) ---
+#define PROCESSED_RING_SIZE 32
+static int s_processed_ring[PROCESSED_RING_SIZE];
+static int s_processed_ring_count = 0;
+
+static bool is_index_processed(int index) {
+    for (int i = 0; i < s_processed_ring_count; i++) {
+        if (s_processed_ring[i] == index) return true;
+    }
+    return false;
+}
+
+static void mark_index_processed(int index) {
+    if (s_processed_ring_count < PROCESSED_RING_SIZE) {
+        s_processed_ring[s_processed_ring_count++] = index;
+    } else {
+        // Ring buffer 滿了，shift 掉最舊的
+        memmove(s_processed_ring, s_processed_ring + 1, 
+                (PROCESSED_RING_SIZE - 1) * sizeof(int));
+        s_processed_ring[PROCESSED_RING_SIZE - 1] = index;
+    }
+}
+
+static void clear_processed_ring(void) {
+    s_processed_ring_count = 0;
+}
+
+// --- Flush 狀態控制 ---
+static int64_t s_last_flush_time = 0;
+#define FLUSH_COOLDOWN_MS 3000  // flush 之間最少間隔 3 秒
+
+// --- 延遲刪除佇列 ---
+#define DELETE_QUEUE_SIZE 16
+static int s_delete_queue[DELETE_QUEUE_SIZE];
+static int s_delete_queue_count = 0;
+
+static void queue_delete_sms(int index) {
+    if (s_delete_queue_count < DELETE_QUEUE_SIZE) {
+        // 避免重複加入
+        for (int i = 0; i < s_delete_queue_count; i++) {
+            if (s_delete_queue[i] == index) return;
+        }
+        s_delete_queue[s_delete_queue_count++] = index;
+    }
+}
+
 static void send_at_command(const char *cmd)
 {
     uart_write_bytes(EX_UART_NUM, cmd, strlen(cmd));
@@ -54,12 +100,24 @@ static void send_at_command(const char *cmd)
     ESP_LOGI(TAG, "Sent: %s", cmd);
 }
 
-static void delete_sms(int index)
-{
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", index);
-    send_at_command(cmd);
-    ESP_LOGI(TAG, "Deleted SMS at index %d", index);
+// 執行延遲刪除（在主循環中呼叫，每次刪一個並等回應）
+static void process_delete_queue(void) {
+    if (s_delete_queue_count > 0) {
+        int index = s_delete_queue[0];
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", index);
+        send_at_command(cmd);
+        ESP_LOGI(TAG, "Deleted SMS at index %d (%d remaining)", 
+                 index, s_delete_queue_count - 1);
+        
+        // 移除佇列頭
+        memmove(s_delete_queue, s_delete_queue + 1, 
+                (s_delete_queue_count - 1) * sizeof(int));
+        s_delete_queue_count--;
+        
+        // 標記為已處理，防止未來 CMGL 再讀到
+        mark_index_processed(index);
+    }
 }
 
 // --- Multipart SMS Assembly Functions ---
@@ -137,7 +195,9 @@ static void publish_single_sms(const char *sender, const char *message, int sms_
                 free(json_str);
                 
                 if (msg_id != -1) {
-                    delete_sms(sms_index);
+                    // 加入延遲刪除佇列 (而非立即刪除)
+                    mark_index_processed(sms_index);
+                    queue_delete_sms(sms_index);
                 } else {
                     ESP_LOGE(TAG, "Failed to publish SMS, keeping in SIM");
                 }
@@ -153,7 +213,9 @@ static void publish_single_sms(const char *sender, const char *message, int sms_
 static void publish_assembled_sms(sms_assembly_buffer_t *buf) {
     if (!buf || buf->received_parts == 0) return;
     
-    char combined_msg[SMS_COMBINED_MSG_SIZE] = {0};
+    // 使用 static 避免 stack overflow (rx_task stack 有限)
+    static char combined_msg[SMS_COMBINED_MSG_SIZE];
+    memset(combined_msg, 0, sizeof(combined_msg));
     
     // 按正確順序組合所有片段 (part_num 是 1-indexed)
     for (int i = 1; i <= buf->total_parts && i <= SMS_MAX_FRAGMENTS; i++) {
@@ -179,10 +241,11 @@ static void publish_assembled_sms(sms_assembly_buffer_t *buf) {
                 free(json_str);
                 
                 if (msg_id != -1) {
-                    // 刪除所有相關的 SMS
+                    // 標記所有分段為已處理，加入延遲刪除佇列
                     for (int i = 1; i <= buf->total_parts && i <= SMS_MAX_FRAGMENTS; i++) {
                         if (buf->part_received[i] && buf->indices[i] >= 0) {
-                            delete_sms(buf->indices[i]);
+                            mark_index_processed(buf->indices[i]);
+                            queue_delete_sms(buf->indices[i]);
                         }
                     }
                 } else {
@@ -251,8 +314,9 @@ static void handle_decoded_sms(pdu_sms_t *sms, int sms_index) {
         } else {
             ESP_LOGW(TAG, "Duplicate fragment %d for ref=%d, ignoring", 
                      sms->part_num, sms->ref_num);
-            // 仍需刪除重複訊息
-            delete_sms(sms_index);
+            // 標記為已處理並加入刪除佇列
+            mark_index_processed(sms_index);
+            queue_delete_sms(sms_index);
         }
     }
 }
@@ -267,9 +331,20 @@ static void parse_pdu_cmgl(char *data) {
     int stat = -1;
     int pdu_len = -1;
     
-    // 解析標頭
+    // 解析標頭 — 嘗試多種格式
     if (sscanf(cmgl_ptr, "+CMGL: %d,%d,,%d", &index, &stat, &pdu_len) < 2) {
-        ESP_LOGW(TAG, "Failed to parse CMGL header");
+        // 可能有 alpha 欄位: +CMGL: 0,1,"",25
+        if (sscanf(cmgl_ptr, "+CMGL: %d,%d,", &index, &stat) < 2) {
+            ESP_LOGW(TAG, "Failed to parse CMGL header");
+            return;
+        }
+    }
+    
+    // 檢查是否已處理過此索引
+    if (is_index_processed(index)) {
+        ESP_LOGI(TAG, "Skipping already processed SMS at index %d", index);
+        // 仍加入刪除佇列確保從 SIM 移除
+        queue_delete_sms(index);
         return;
     }
     
@@ -318,6 +393,14 @@ static void rx_task(void *arg)
     static char uart_buffer[4096] = {0};
     static int uart_buffer_pos = 0;
     
+    // Debounce: 收到 +CMTI 後延遲一段時間再 flush，讓所有分段到齊
+    static int64_t cmti_pending_time = 0;  // 0 = 沒有 pending
+    static const int CMTI_DEBOUNCE_MS = 2000; // 等 2 秒讓後續分段到達
+    
+    // 上次處理刪除佇列的時間
+    static int64_t last_delete_time = 0;
+    static const int DELETE_INTERVAL_MS = 500; // 每 500ms 處理一個刪除
+    
     if (!dtmp) {
         vTaskDelete(NULL);
         return;
@@ -339,11 +422,15 @@ static void rx_task(void *arg)
     send_at_command("AT+CPIN?"); 
     vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // *** PDU Mode (關鍵變更) ***
+    // 設定訊息儲存位置為 SIM 卡
+    send_at_command("AT+CPMS=\"SM\",\"SM\",\"SM\"");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // *** PDU Mode ***
     send_at_command("AT+CMGF=0");
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // IMPORTANT: Store messages in SIM (SM), notify with +CMTI
+    // Store messages in SIM (SM), notify with +CMTI
     send_at_command("AT+CNMI=2,1,0,0,0"); 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -355,15 +442,53 @@ static void rx_task(void *arg)
     }
 
     for (;;) {
+        int64_t now = get_time_ms();
+        
         // 檢查分段簡訊組合逾時
         check_assembly_timeouts();
         
-        // Check if we need to flush messages
+        // 處理延遲刪除佇列（每次只刪一個，避免指令衝突）
+        if (s_delete_queue_count > 0 && (now - last_delete_time) >= DELETE_INTERVAL_MS) {
+            process_delete_queue();
+            last_delete_time = now;
+        }
+        
+        // CMTI debounce: 等待一段時間後再觸發 flush
+        // 但如果有刪除佇列未完成，延後 flush (避免 CMGD 和 CMGL 衝突)
+        if (cmti_pending_time > 0 && s_delete_queue_count == 0) {
+            if ((now - cmti_pending_time) >= CMTI_DEBOUNCE_MS) {
+                cmti_pending_time = 0;
+                if (g_app_state == APP_STATE_MQTT_CONNECTED) {
+                    // 確保 flush cooldown
+                    if ((now - s_last_flush_time) >= FLUSH_COOLDOWN_MS) {
+                        ESP_LOGI(TAG, "CMTI debounce expired, flushing stored messages...");
+                        clear_processed_ring();
+                        send_at_command("AT+CMGL=4");
+                        s_last_flush_time = now;
+                    } else {
+                        // cooldown 尚未到，延後
+                        cmti_pending_time = now;
+                    }
+                }
+            }
+        }
+        
+        // Check if we need to flush messages (from MQTT connect or external trigger)
+        // 同樣需要等刪除佇列清空
         if (xSemaphoreTake(flush_sem, 0) == pdTRUE) {
-             if (g_app_state == APP_STATE_MQTT_CONNECTED) {
-                 ESP_LOGI(TAG, "Flushing stored messages...");
-                 // PDU Mode 使用數字狀態：4 = ALL
-                 send_at_command("AT+CMGL=4");
+             if (g_app_state == APP_STATE_MQTT_CONNECTED && s_delete_queue_count == 0) {
+                 if ((now - s_last_flush_time) >= FLUSH_COOLDOWN_MS) {
+                     ESP_LOGI(TAG, "Flushing stored messages...");
+                     clear_processed_ring();
+                     send_at_command("AT+CMGL=4");
+                     s_last_flush_time = now;
+                 } else {
+                     // 重新排程
+                     xSemaphoreGive(flush_sem);
+                 }
+             } else if (s_delete_queue_count > 0) {
+                 // 刪除佇列未清，重新排程
+                 xSemaphoreGive(flush_sem);
              }
         }
 
@@ -381,25 +506,10 @@ static void rx_task(void *arg)
                             uart_buffer_pos += read_len;
                             uart_buffer[uart_buffer_pos] = 0;
                             
-                            // Check for +CMTI (New Message Indication)
-                            if (strstr(uart_buffer, "+CMTI:")) {
-                                ESP_LOGI(TAG, "New Message Indication received");
-                                sim_modem_trigger_flush();
-                                uart_buffer_pos = 0; 
-                                uart_buffer[0] = 0;
-                                continue;
-                            }
-
-                            // Process +CMGL responses (PDU Mode)
+                            // === 最優先：先處理 +CMGL 回應 (PDU Mode) ===
                             while (1) {
                                 char *cmgl_start = strstr(uart_buffer, "+CMGL:");
-                                if (!cmgl_start) {
-                                    if (uart_buffer_pos > 2048) {
-                                        uart_buffer_pos = 0;
-                                        uart_buffer[0] = 0;
-                                    }
-                                    break;
-                                }
+                                if (!cmgl_start) break;
 
                                 // 找標頭後的換行 (PDU 在下一行)
                                 char *header_end = strchr(cmgl_start, '\n');
@@ -410,19 +520,83 @@ static void rx_task(void *arg)
                                 char *pdu_end = strstr(pdu_start, "\r\n");
                                 
                                 if (pdu_end) {
-                                    // Temporarily terminate
-                                    char saved = pdu_end[2];
-                                    pdu_end[2] = 0;
-                                    
-                                    parse_pdu_cmgl(cmgl_start);
-                                    
-                                    pdu_end[2] = saved;
-                                    
-                                    // Shift buffer
-                                    int processed = (pdu_end + 2) - uart_buffer;
-                                    int remain = uart_buffer_pos - processed;
+                                    // 安全地 null-terminate：計算 pdu_end+2 是否在 buffer 範圍內
+                                    int end_offset = (pdu_end + 2) - uart_buffer;
+                                    if (end_offset <= uart_buffer_pos) {
+                                        char saved = uart_buffer[end_offset];
+                                        uart_buffer[end_offset] = 0;
+                                        
+                                        parse_pdu_cmgl(cmgl_start);
+                                        
+                                        uart_buffer[end_offset] = saved;
+                                        
+                                        // Shift buffer: 消費掉已處理的部分
+                                        int remain = uart_buffer_pos - end_offset;
+                                        if (remain > 0) {
+                                            memmove(uart_buffer, uart_buffer + end_offset, remain);
+                                            uart_buffer_pos = remain;
+                                            uart_buffer[uart_buffer_pos] = 0;
+                                        } else {
+                                            uart_buffer_pos = 0;
+                                            uart_buffer[0] = 0;
+                                        }
+                                        continue; // 繼續找更多 +CMGL
+                                    }
+                                }
+                                break; // PDU 還沒完全收到，等下次
+                            }
+                            
+                            // === 處理 +CMTI (新訊息通知) ===
+                            while (1) {
+                                char *cmti_start = strstr(uart_buffer, "+CMTI:");
+                                if (!cmti_start) break;
+                                
+                                // 找到 +CMTI 行的結尾
+                                char *cmti_end = strstr(cmti_start, "\r\n");
+                                if (!cmti_end) {
+                                    cmti_end = strchr(cmti_start, '\n');
+                                    if (!cmti_end) break;
+                                }
+                                
+                                ESP_LOGI(TAG, "New Message Indication received");
+                                
+                                // 設定 debounce timer (用最後一次 +CMTI 的時間)
+                                cmti_pending_time = get_time_ms();
+                                
+                                // 從 buffer 裡移除這行 +CMTI
+                                char *consume_end = cmti_end;
+                                if (consume_end[0] == '\r') consume_end++;
+                                if (consume_end[0] == '\n') consume_end++;
+                                
+                                int consumed = consume_end - uart_buffer;
+                                int remain = uart_buffer_pos - consumed;
+                                if (remain > 0) {
+                                    memmove(uart_buffer, uart_buffer + consumed, remain);
+                                    uart_buffer_pos = remain;
+                                    uart_buffer[uart_buffer_pos] = 0;
+                                } else {
+                                    uart_buffer_pos = 0;
+                                    uart_buffer[0] = 0;
+                                }
+                            }
+                            
+                            // === 清理：移除已知的非重要回應 ===
+                            while (1) {
+                                // 清除開頭的空白和換行
+                                while (uart_buffer_pos > 0 && 
+                                       (uart_buffer[0] == '\r' || uart_buffer[0] == '\n' || uart_buffer[0] == ' ')) {
+                                    memmove(uart_buffer, uart_buffer + 1, uart_buffer_pos - 1);
+                                    uart_buffer_pos--;
+                                    uart_buffer[uart_buffer_pos] = 0;
+                                }
+                                
+                                char *ok_str = strstr(uart_buffer, "OK\r\n");
+                                if (ok_str) {
+                                    char *after = ok_str + 4;
+                                    int consumed = after - uart_buffer;
+                                    int remain = uart_buffer_pos - consumed;
                                     if (remain > 0) {
-                                        memmove(uart_buffer, uart_buffer + processed, remain);
+                                        memmove(uart_buffer, after, remain);
                                         uart_buffer_pos = remain;
                                         uart_buffer[uart_buffer_pos] = 0;
                                     } else {
@@ -431,10 +605,55 @@ static void rx_task(void *arg)
                                     }
                                     continue;
                                 }
+                                
+                                char *err_str = strstr(uart_buffer, "ERROR\r\n");
+                                if (err_str) {
+                                    char *after = err_str + 7;
+                                    int consumed = after - uart_buffer;
+                                    int remain = uart_buffer_pos - consumed;
+                                    if (remain > 0) {
+                                        memmove(uart_buffer, after, remain);
+                                        uart_buffer_pos = remain;
+                                        uart_buffer[uart_buffer_pos] = 0;
+                                    } else {
+                                        uart_buffer_pos = 0;
+                                        uart_buffer[0] = 0;
+                                    }
+                                    continue;
+                                }
+                                
+                                // 清理 +CPMS 回應等 (AT+CPMS 回應格式: +CPMS: ...)
+                                char *cpms_str = strstr(uart_buffer, "+CPMS:");
+                                if (cpms_str) {
+                                    char *cpms_end = strstr(cpms_str, "\r\n");
+                                    if (cpms_end) {
+                                        char *after = cpms_end + 2;
+                                        int consumed = after - uart_buffer;
+                                        int remain = uart_buffer_pos - consumed;
+                                        if (remain > 0) {
+                                            memmove(uart_buffer, after, remain);
+                                            uart_buffer_pos = remain;
+                                            uart_buffer[uart_buffer_pos] = 0;
+                                        } else {
+                                            uart_buffer_pos = 0;
+                                            uart_buffer[0] = 0;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                
                                 break;
                             }
+                            
+                            // 防止 buffer 累積過多
+                            if (uart_buffer_pos > 2048) {
+                                ESP_LOGW(TAG, "UART buffer overflow, resetting (%d bytes)", uart_buffer_pos);
+                                uart_buffer_pos = 0;
+                                uart_buffer[0] = 0;
+                            }
                         } else {
-                            uart_buffer_pos = 0; // Overflow reset
+                            ESP_LOGW(TAG, "UART buffer full, resetting");
+                            uart_buffer_pos = 0;
                         }
                     }
                 }
@@ -472,5 +691,7 @@ void sim_modem_init_uart(void)
 
 void sim_modem_start_task(void)
 {
-    xTaskCreate(rx_task, "uart_rx_task", 4096, NULL, 5, NULL);
+    // 增加 stack 到 8192 (publish_assembled_sms 使用 static combined_msg,
+    // 但 cJSON + pdu_decode call chain 仍需足夠 stack)
+    xTaskCreate(rx_task, "uart_rx_task", 8192, NULL, 5, NULL);
 }
