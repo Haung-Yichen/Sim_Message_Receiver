@@ -1,21 +1,22 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.espIdfPathWin": "C:\\Users\\macma\\esp\\v5.5.1\\esp-idf",
-  "idf.pythonInstallPath": "C:\\Users\\macma\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.espIdfPathWin": "C:\\esp\\v6.0.1\\esp-idf",
+  "idf.pythonInstallPath": "C:\\Espressif\\tools\\python\\v6.0.1\\venv\\Scripts\\python.exe",
   "idf.openOcdConfigs": [
-    "board/esp32-wrover-kit-3.3v.cfg"
+    "\"board/esp-wroom-32.cfg\""
   ],
-  "idf.toolsPathWin": "C:\\Users\\macma\\.espressif",
+  "idf.toolsPathWin": "C:\\Espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
-  "clangd.path": "C:\\Users\\macma\\.espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
-    "--query-driver=C:\\Users\\macma\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
+    "--query-driver=C:\\Espressif\\tools\\xtensa-esp-elf\\esp-15.2.0_20251204\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
     "--compile-commands-dir=${workspaceFolder}\\build"
   ],
-  "idf.portWin": "COM5",
+  "idf.portWin": "COM6",
   "idf.flashType": "UART",
-  "idf.currentSetup": "C:\\Users\\macma\\esp\\v5.5.1\\esp-idf"
+  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
+  "idf.flashBaudRate": "115200"
 }
