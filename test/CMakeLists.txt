@@ -15,7 +15,11 @@ add_executable(run_tests
     test_main.c
     test_pdu_decoder.c
     test_sms_assembly.c
+    test_long_message.c
+    test_health_logic.c
+    test_heartbeat_format.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../main/pdu_decoder.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../main/health_logic.c
 )
 
 # Enable warnings

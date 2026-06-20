@@ -6,6 +6,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "lwip/err.h"
@@ -21,7 +22,20 @@ static const char *TAG = "WIFI_MQTT";
 volatile app_state_t g_app_state = APP_STATE_INIT;
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
+// --- WiFi 重連控制（不在 event handler 內 block）---
+#define WIFI_RECONNECT_DELAY_MS   5000   // 重連間隔（節流，避免猛打）
+#define WIFI_MAX_RECONNECT        60     // 連續失敗約 5 分鐘仍連不上 -> 重啟
+static esp_timer_handle_t s_wifi_reconnect_timer = NULL;
+static int s_wifi_reconnect_count = 0;
+
 static void mqtt_app_start(void);
+
+// esp_timer callback：跑在 timer task，非 event task，不會卡住事件迴圈
+static void wifi_reconnect_timer_cb(void *arg)
+{
+    (void)arg;
+    esp_wifi_connect();
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -61,13 +75,31 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         g_app_state = APP_STATE_INIT;
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         g_app_state = APP_STATE_INIT;
-        ESP_LOGI(TAG, "WiFi disconnected, retrying in 5 seconds...");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_wifi_connect();
+        s_wifi_reconnect_count++;
+
+        // 連續重連失敗超過上限 -> 乾淨重啟（避免「在線但永遠連不回來」的假死）
+        if (s_wifi_reconnect_count > WIFI_MAX_RECONNECT) {
+            ESP_LOGE(TAG, "WiFi reconnect failed %d times, restarting...", s_wifi_reconnect_count);
+            esp_restart();
+        }
+
+        ESP_LOGI(TAG, "WiFi disconnected, retry #%d in %d ms",
+                 s_wifi_reconnect_count, WIFI_RECONNECT_DELAY_MS);
+
+        // 用 oneshot timer 做節流重連，不在 event handler 內 vTaskDelay 卡住事件迴圈
+        if (s_wifi_reconnect_timer) {
+            esp_timer_stop(s_wifi_reconnect_timer); // 若已在跑先停，避免 INVALID_STATE
+            esp_timer_start_once(s_wifi_reconnect_timer,
+                                 (uint64_t)WIFI_RECONNECT_DELAY_MS * 1000);
+        } else {
+            esp_wifi_connect();
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        
+
+        s_wifi_reconnect_count = 0; // 連上了，歸零
+
         if (g_app_state != APP_STATE_MQTT_CONNECTED) {
             g_app_state = APP_STATE_WIFI_CONNECTED;
         }
@@ -133,6 +165,13 @@ void wifi_mqtt_init(void)
         },
     };
     
+    // 建立 WiFi 重連節流用的 oneshot timer
+    esp_timer_create_args_t reconnect_timer_args = {
+        .callback = &wifi_reconnect_timer_cb,
+        .name = "wifi_reconnect",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&reconnect_timer_args, &s_wifi_reconnect_timer));
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());

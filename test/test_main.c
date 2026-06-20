@@ -16,6 +16,9 @@ const char *unity_current_test = "";
 
 extern void run_pdu_decoder_tests(void);
 extern void run_sms_assembly_tests(void);
+extern void run_long_message_tests(void);
+extern void run_health_logic_tests(void);
+extern void run_heartbeat_format_tests(void);
 
 int main(void) {
     printf("========================================\n");
@@ -24,6 +27,9 @@ int main(void) {
 
     run_pdu_decoder_tests();
     run_sms_assembly_tests();
+    run_long_message_tests();
+    run_health_logic_tests();
+    run_heartbeat_format_tests();
 
     unity_print_summary();
 

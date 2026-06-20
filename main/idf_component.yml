@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/mqtt:
+    version: ">=1.0.0"
+  espressif/cjson:
+    version: ">=1.7.19"

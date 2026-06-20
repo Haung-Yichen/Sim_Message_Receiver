@@ -1,0 +1,10 @@
+# Project sdkconfig defaults (committed; seeds a fresh `sdkconfig`).
+#
+# The live sdkconfig is gitignored, so settings the firmware depends on are
+# pinned here for reproducible builds.
+
+# Watchdog: make the Task WDT actually REBOOT on timeout. The IDF default only
+# prints a warning, which is why an earlier hang went unnoticed for a long time.
+# rx_task subscribes to the TWDT (see main/sim_modem.c); this turns a real stall
+# into a clean panic+restart.
+CONFIG_ESP_TASK_WDT_PANIC=y

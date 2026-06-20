@@ -1,8 +1,13 @@
 # ESP-IDF Build Artifacts
 build/
+test/build/
 sdkconfig
-sdkconfig.old
+*.old
 main/config.h
+
+# ESP-IDF Component Manager (auto-downloaded, do not commit)
+managed_components/
+dependencies.lock
 
 # Python
 *.pyc

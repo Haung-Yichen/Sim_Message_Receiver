@@ -9,6 +9,7 @@
 #include "app_common.h"
 #include "wifi_mqtt.h"
 #include "sim_modem.h"
+#include "health_monitor.h"
 
 static const char *TAG = "MAIN";
 
@@ -65,7 +66,11 @@ void app_main(void)
     
     // Start SIM RX Task (Handles initialization sequence and message loop)
     sim_modem_start_task();
-    
+
+    // Start application-level software watchdog (catches "logic death":
+    // MQTT offline too long, or rx_task silently stopped making progress).
+    health_monitor_start();
+
     // LED Blink Task
     gpio_reset_pin(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);

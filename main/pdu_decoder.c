@@ -129,26 +129,58 @@ static void decode_gsm7bit(const char *hex, int num_septets, int udh_bits, char 
 
 /**
  * @brief Decode UCS2 (UTF-16BE) hex to UTF-8
+ *
+ * Handles UTF-16 surrogate pairs: characters above U+FFFF (e.g. emoji) arrive
+ * as a high surrogate (0xD800-0xDBFF) followed by a low surrogate
+ * (0xDC00-0xDFFF) and must be combined into one code point, then encoded as
+ * 4-byte UTF-8. Emitting each surrogate half on its own produces INVALID UTF-8
+ * (0xED 0xA0..), which downstream consumers reject -- dropping the whole SMS.
+ * An unpaired surrogate is replaced with U+FFFD rather than emitted raw.
  */
 static void decode_ucs2(const char *hex, int num_octets, int udh_octets, char *out, size_t out_size) {
     const char *data_start = hex + (udh_octets * 2);
-    int data_octets = num_octets - udh_octets;
-    
+    int data_hexlen = (num_octets - udh_octets) * 2;
+
     size_t j = 0;
-    for (int i = 0; i + 3 < data_octets * 2 && j + 4 < out_size; i += 4) {
+    int i = 0;
+    while (i + 3 < data_hexlen && j + 4 < out_size) {
         int b1 = hex_to_byte(data_start + i);
         int b2 = hex_to_byte(data_start + i + 2);
+        i += 4;
         if (b1 < 0 || b2 < 0) continue;
-        
-        uint16_t wc = (b1 << 8) | b2;
-        
+
+        uint32_t wc = (uint32_t)((b1 << 8) | b2);
+
+        // High surrogate: try to pair with the following low surrogate.
+        if (wc >= 0xD800 && wc <= 0xDBFF && i + 3 < data_hexlen) {
+            int b3 = hex_to_byte(data_start + i);
+            int b4 = hex_to_byte(data_start + i + 2);
+            if (b3 >= 0 && b4 >= 0) {
+                uint32_t lo = (uint32_t)((b3 << 8) | b4);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    wc = 0x10000u + ((wc - 0xD800u) << 10) + (lo - 0xDC00u);
+                    i += 4; // consume the low surrogate too
+                }
+            }
+        }
+
+        // Any leftover (unpaired) surrogate is not a valid scalar value.
+        if (wc >= 0xD800 && wc <= 0xDFFF) {
+            wc = 0xFFFD;
+        }
+
         if (wc < 0x80) {
             out[j++] = (char)wc;
         } else if (wc < 0x800) {
             out[j++] = 0xC0 | (wc >> 6);
             out[j++] = 0x80 | (wc & 0x3F);
-        } else {
+        } else if (wc < 0x10000) {
             out[j++] = 0xE0 | (wc >> 12);
+            out[j++] = 0x80 | ((wc >> 6) & 0x3F);
+            out[j++] = 0x80 | (wc & 0x3F);
+        } else {
+            out[j++] = 0xF0 | (wc >> 18);
+            out[j++] = 0x80 | ((wc >> 12) & 0x3F);
             out[j++] = 0x80 | ((wc >> 6) & 0x3F);
             out[j++] = 0x80 | (wc & 0x3F);
         }

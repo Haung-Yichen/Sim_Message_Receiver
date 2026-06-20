@@ -8,11 +8,13 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "cJSON.h"
 #include "mqtt_client.h"
 #include "app_common.h"
 #include "config.h"
 #include "pdu_decoder.h"
+#include "health_monitor.h"
 
 static const char *TAG = "SIM_MODEM";
 
@@ -435,14 +437,24 @@ static void rx_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     ESP_LOGI(TAG, "SIM Init Done (PDU Mode). Waiting for messages...");
-    
+
     // Initial flush if already connected
     if (g_app_state == APP_STATE_MQTT_CONNECTED) {
         sim_modem_trigger_flush();
     }
 
+    // 訂閱 Task WDT：初始化已完成（前面的 vTaskDelay 累計 >5s，所以必須在這裡才加）。
+    // 之後每圈 reset；若 rx_task 真的卡在某個 blocking call >timeout，硬體會 panic 重啟。
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to subscribe rx_task to Task WDT");
+    }
+
     for (;;) {
         int64_t now = get_time_ms();
+
+        // 餵硬體 Task WDT + 通知軟體 watchdog「rx_task 還活著」
+        esp_task_wdt_reset();
+        health_notify_sim_alive();
         
         // 檢查分段簡訊組合逾時
         check_assembly_timeouts();
